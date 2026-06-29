@@ -6,6 +6,7 @@ const { Anthropic } = require("@anthropic-ai/sdk");
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const alerted = new Set();
 
@@ -110,6 +111,13 @@ function formatRisk(riskScore) {
   if (riskScore >= 60) return "Low";
   if (riskScore >= 40) return "Medium";
   return "High";
+}
+async function sendAdminAlert(message) {
+  try {
+    await bot.sendMessage(ADMIN_CHAT_ID, "⚠️ BOT ERROR\n\n" + message);
+  } catch (e) {
+    console.error("Failed to send admin alert:", e.message);
+  }
 }
 
 async function generateAnalysis(token, rugcheck) {
@@ -217,23 +225,32 @@ async function sendAlert(token, rugcheck) {
 
 async function scan() {
   console.log("Scanning for new tokens...");
-  const tokens = await fetchNewTokens();
-  let passed = 0;
-
-  for (const token of tokens) {
-    const id = token.pairAddress || token.tokenAddress;
-    if (!id || alerted.has(id)) continue;
-    if (await passesFilter(token)) {
-      passed++;
-      alerted.add(id);
-      const rugcheck = await getRugcheckData(token.tokenAddress);
-      await sendAlert(token, rugcheck);
-      console.log("Alert sent for $" + token.baseToken?.symbol);
+  try {
+    const tokens = await fetchNewTokens();
+    let passed = 0;
+    for (const token of tokens) {
+      const id = token.pairAddress || token.tokenAddress;
+      if (!id || alerted.has(id)) continue;
+      try {
+        if (await passesFilter(token)) {
+          passed++;
+          alerted.add(id);
+          const rugcheck = await getRugcheckData(token.tokenAddress);
+          await sendAlert(token, rugcheck);
+          console.log("Alert sent for $" + token.baseToken?.symbol);
+        }
+      } catch (e) {
+        console.error("Error processing token:", e.message);
+        await sendAdminAlert("Error processing token: " + e.message);
+      }
     }
+    console.log(
+      "Done. " + tokens.length + " checked, " + passed + " alerts sent.",
+    );
+  } catch (e) {
+    console.error("Scan failed:", e.message);
+    await sendAdminAlert("Scan failed: " + e.message);
   }
-  console.log(
-    "Done. " + tokens.length + " checked, " + passed + " alerts sent.",
-  );
 }
 
 scan();
