@@ -75,7 +75,7 @@ async function passesFilter(token) {
   return true;
 }
 
-function scoreToken(token) {
+function scoreToken(token, rugcheck) {
   let score = 5;
   const volume = token?.volume?.h1 || 0;
   const buys = token?.txns?.h1?.buys || 0;
@@ -89,7 +89,14 @@ function scoreToken(token) {
   if (priceChange > 10) score += 1;
   if (liquidity > 50000 || marketCap > 60000) score += 1;
 
-  return Math.min(score, 10);
+  if (rugcheck) {
+    if (rugcheck.lpLockedPct === 0) score -= 2;
+    if (rugcheck.topHolderPct > 15) score -= 1;
+    if (rugcheck.risks.some((r) => r.name.toLowerCase().includes("rug")))
+      score -= 2;
+  }
+
+  return Math.min(Math.max(score, 1), 10);
 }
 
 function getRiskLevel(score) {
@@ -128,7 +135,7 @@ Provide:
 
     const message = await anthropic.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 150,
+      max_tokens: 250,
       messages: [
         {
           role: "user",
@@ -147,7 +154,7 @@ Provide:
 }
 
 async function sendAlert(token, rugcheck) {
-  const score = scoreToken(token);
+  const score = scoreToken(token, rugcheck);
   const risk = getRiskLevel(score);
   const liquidity = token?.liquidity?.usd || 0;
   const platform = liquidity === 0 ? "Pump.fun" : "Raydium";
