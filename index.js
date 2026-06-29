@@ -2,10 +2,11 @@ require("dotenv").config();
 const axios = require("axios");
 const TelegramBot =
   require("node-telegram-bot-api").default || require("node-telegram-bot-api");
+const { Anthropic } = require("@anthropic-ai/sdk");
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const alerted = new Set();
 
 async function fetchNewTokens() {
@@ -17,7 +18,7 @@ async function fetchNewTokens() {
       (t) => t.chainId === "solana",
     );
     const tokens = [];
-    for (const profile of profiles.slice(0, 20)) {
+    for (const profile of profiles.slice(0, 50)) {
       try {
         const pairRes = await axios.get(
           "https://api.dexscreener.com/latest/dex/tokens/" +
@@ -34,7 +35,28 @@ async function fetchNewTokens() {
   }
 }
 
-function passesFilter(token) {
+async function getRugcheckData(tokenAddress) {
+  try {
+    const res = await axios.get(
+      "https://api.rugcheck.xyz/v1/tokens/" + tokenAddress + "/report",
+      {
+        timeout: 5000,
+      },
+    );
+    const topHolder = res.data?.topHolders?.[0];
+    return {
+      score: res.data?.score_normalised || 0,
+      lpLockedPct: res.data?.lpLockedPct || 0,
+      risks: res.data?.risks || [],
+      totalHolders: res.data?.totalHolders || 0,
+      topHolderPct: topHolder?.pct || 0,
+    };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function passesFilter(token) {
   const chainId = token?.chainId || "";
   const volume = token?.volume?.h1 || 0;
   const liquidity = token?.liquidity?.usd || 0;
@@ -46,6 +68,9 @@ function passesFilter(token) {
   if (buys < 20) return false;
   if (liquidity === 0 && marketCap < 30000) return false;
   if (liquidity > 0 && liquidity < 10000) return false;
+
+  const rugcheck = await getRugcheckData(token.tokenAddress);
+  if (!rugcheck || rugcheck.score < 65) return false;
 
   return true;
 }
@@ -73,20 +98,74 @@ function getRiskLevel(score) {
   return "High";
 }
 
-async function sendAlert(token) {
+function formatRisk(riskScore) {
+  if (riskScore >= 80) return "Very Low";
+  if (riskScore >= 60) return "Low";
+  if (riskScore >= 40) return "Medium";
+  return "High";
+}
+
+async function generateAnalysis(token, rugcheck) {
+  try {
+    const prompt = `You are a crypto memecoin analyst. Analyze this Solana token and provide a brief trading signal (2-3 sentences max).
+
+Token: ${token.baseToken?.name}
+Ticker: ${token.baseToken?.symbol}
+Market Cap: $${(token?.marketCap || 0).toLocaleString()}
+Liquidity: $${(token?.liquidity?.usd || 0).toLocaleString()}
+Volume (1h): $${(token?.volume?.h1 || 0).toLocaleString()}
+Buys/Sells (1h): ${token?.txns?.h1?.buys || 0}/${token?.txns?.h1?.sells || 0}
+Price Change (1h): ${token?.priceChange?.h1 || 0}%
+Total Holders: ${rugcheck?.totalHolders || 0}
+Top Holder: ${rugcheck?.topHolderPct.toFixed(2) || 0}%
+LP Locked: ${rugcheck?.lpLockedPct || 0}%
+Rugcheck Score: ${rugcheck?.score || 0}/100
+
+Provide:
+1. One sentence on momentum/signals
+2. Suggested exit range (e.g., 3x-5x or $100k-$150k mcap)
+3. One key risk to watch`;
+
+    const message = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 150,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    });
+
+    return message.content[0].type === "text"
+      ? message.content[0].text
+      : "Unable to generate analysis";
+  } catch (e) {
+    console.error("Claude error:", e.message);
+    return "Analysis unavailable";
+  }
+}
+
+async function sendAlert(token, rugcheck) {
   const score = scoreToken(token);
   const risk = getRiskLevel(score);
   const liquidity = token?.liquidity?.usd || 0;
   const platform = liquidity === 0 ? "Pump.fun" : "Raydium";
   const ageMs = Date.now() - (token?.pairCreatedAt || 0);
   const ageMin = Math.floor(ageMs / 60000);
+  const contractAddr = token.tokenAddress || token.pairAddress || "N/A";
+
+  const analysis = await generateAnalysis(token, rugcheck);
 
   const message = [
     "NEW TOKEN ALERT",
     "",
     "Name: " + (token.baseToken?.name || "Unknown"),
     "Ticker: $" + (token.baseToken?.symbol || "N/A"),
-    "Contract: " + (token.tokenAddress || token.pairAddress || "N/A"),
+    "Contract:",
+    "```",
+    contractAddr,
+    "```",
     "Chain: Solana",
     "Platform: " + platform,
     "",
@@ -102,16 +181,28 @@ async function sendAlert(token) {
     "Price Change (1h): " + (token?.priceChange?.h1 || 0) + "%",
     "",
     "-----------------",
+    "SAFETY",
+    "Rugcheck Score: " + (rugcheck?.score || 0) + "/100",
+    "Risk Level: " + formatRisk(rugcheck?.score || 0),
+    "Total Holders: " + (rugcheck?.totalHolders || 0),
+    "Top Holder: " + (rugcheck?.topHolderPct.toFixed(2) || 0) + "%",
+    "LP Locked: " + (rugcheck?.lpLockedPct || 0) + "%",
+    rugcheck && rugcheck.risks.length > 0
+      ? "Flags: " + rugcheck.risks.map((r) => r.name).join(", ")
+      : "Flags: None detected",
+    "",
+    "-----------------",
     "RISK LEVEL: " + risk,
     "SCORE: " + score + "/10",
     "",
     "-----------------",
-    "ANALYSIS: Early signal detected. Monitor closely. Exit suggested at 3x-5x.",
+    "ANALYSIS",
+    analysis,
     "",
     "-----------------",
     "Age: " + ageMin + " mins",
     "DexScreener: https://dexscreener.com/solana/" + token.pairAddress,
-    "Rugcheck: https://rugcheck.xyz/tokens/" + (token.tokenAddress || ""),
+    "Rugcheck: https://rugcheck.xyz/tokens/" + contractAddr,
   ].join("\n");
 
   await bot.sendMessage(CHAT_ID, message);
@@ -125,10 +216,11 @@ async function scan() {
   for (const token of tokens) {
     const id = token.pairAddress || token.tokenAddress;
     if (!id || alerted.has(id)) continue;
-    if (passesFilter(token)) {
+    if (await passesFilter(token)) {
       passed++;
       alerted.add(id);
-      await sendAlert(token);
+      const rugcheck = await getRugcheckData(token.tokenAddress);
+      await sendAlert(token, rugcheck);
       console.log("Alert sent for $" + token.baseToken?.symbol);
     }
   }
@@ -139,4 +231,4 @@ async function scan() {
 
 scan();
 setInterval(scan, 30000);
-console.log("Memecoin bot started...");
+console.log("Memecoin bot started with Claude AI...");
