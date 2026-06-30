@@ -3,8 +3,6 @@ const axios = require("axios");
 const TelegramBot =
   require("node-telegram-bot-api").default || require("node-telegram-bot-api");
 const { Anthropic } = require("@anthropic-ai/sdk");
-
-// const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -88,20 +86,39 @@ async function passesFilter(token) {
   const liquidity = token?.liquidity?.usd || 0;
   const marketCap = token?.marketCap || 0;
   const buys = token?.txns?.h1?.buys || 0;
+  const name = token?.baseToken?.symbol || "unknown";
 
   if (chainId !== "solana") return false;
-  if (volume < 5000) return false;
-  if (buys < 20) return false;
-  if (liquidity === 0 && marketCap < 30000) return false;
-  if (liquidity > 0 && liquidity < 10000) return false;
+  if (volume < 5000) {
+    console.log(name, "failed: low volume", volume);
+    return false;
+  }
+  if (buys < 20) {
+    console.log(name, "failed: low buys", buys);
+    return false;
+  }
+  if (liquidity === 0 && marketCap < 30000) {
+    console.log(name, "failed: low mcap");
+    return false;
+  }
+  if (liquidity > 0 && liquidity < 10000) {
+    console.log(name, "failed: low liquidity", liquidity);
+    return false;
+  }
 
   const rugcheck = await getRugcheckData(token.tokenAddress);
-  if (!rugcheck || rugcheck.score < 65) return false;
-
-  // Hard rejects — these override an otherwise decent Rugcheck score
-  if (rugcheck.topHolderPct > 30) return false;
-  if (rugcheck.risks.some((r) => r.name.toLowerCase().includes("rug")))
+  if (!rugcheck || rugcheck.score < 65) {
+    console.log(name, "failed: rugcheck score", rugcheck?.score);
     return false;
+  }
+  if (rugcheck.topHolderPct > 30) {
+    console.log(name, "failed: top holder", rugcheck.topHolderPct);
+    return false;
+  }
+  if (rugcheck.risks.some((r) => r.name.toLowerCase().includes("rug"))) {
+    console.log(name, "failed: rug flag");
+    return false;
+  }
 
   return true;
 }
