@@ -8,6 +8,7 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const alerted = new Set();
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS;
 
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
@@ -56,15 +57,26 @@ async function fetchNewTokens() {
 
   // Source 1: DexScreener new pairs
   try {
-    const res = await axios.get(
-      "https://api.dexscreener.com/latest/dex/pairs/solana",
+    const profilesRes = await axios.get(
+      "https://api.dexscreener.com/token-profiles/latest/v1",
     );
-    const pairs = res.data?.pairs || [];
-    for (const pair of pairs.slice(0, 50)) {
-      const addr = pair.baseToken?.address;
-      if (addr && !tokenMap.has(addr)) {
-        tokenMap.set(addr, { ...pair, tokenAddress: addr });
-      }
+    const profiles = (profilesRes.data || []).filter(
+      (t) => t.chainId === "solana",
+    );
+    for (const profile of profiles.slice(0, 50)) {
+      try {
+        const pairRes = await axios.get(
+          "https://api.dexscreener.com/latest/dex/tokens/" +
+            profile.tokenAddress,
+        );
+        const pair = pairRes.data?.pairs?.[0];
+        if (pair) {
+          const addr = profile.tokenAddress;
+          if (!tokenMap.has(addr)) {
+            tokenMap.set(addr, { ...pair, tokenAddress: addr });
+          }
+        }
+      } catch (e) {}
     }
   } catch (e) {
     console.error("DexScreener fetch error:", e.message);
@@ -339,20 +351,65 @@ async function sendAlert(token, rugcheck) {
   ].join("\n");
 
   const subs = loadSubscribers();
-  for (const chatId of subs) {
+  for (const sub of subs) {
+    const chatId = sub.chatId;
     try {
-      await bot.sendMessage(chatId, message, {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: " Copy Contract Address",
-                copy_text: { text: contractAddr },
-              },
+      const now = new Date();
+      const expiry = sub.expiry ? new Date(sub.expiry) : null;
+      const isExpired = expiry && now > expiry;
+
+      // If subscribed but expired, flip them back
+      if (sub.subscribed && isExpired) {
+        updateSubscriber(chatId, { subscribed: false, expiry: null });
+        sub.subscribed = false;
+      }
+
+      if (sub.subscribed) {
+        // Paid subscriber — send normally
+        await bot.sendMessage(chatId, message, {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "📋 Copy Contract Address",
+                  copy_text: { text: contractAddr },
+                },
+              ],
             ],
-          ],
-        },
-      });
+          },
+        });
+      } else if (sub.alertCount < 30) {
+        // Free trial — send and increment count
+        await bot.sendMessage(chatId, message, {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: "📋 Copy Contract Address",
+                  copy_text: { text: contractAddr },
+                },
+              ],
+            ],
+          },
+        });
+        updateSubscriber(chatId, { alertCount: sub.alertCount + 1 });
+
+        // Warn at 25 alerts
+        if (sub.alertCount + 1 === 25) {
+          await bot.sendMessage(
+            chatId,
+            "You have 5 free alerts remaining. Subscribe to continue receiving alerts after your trial ends.",
+          );
+        }
+      } else {
+        // Trial exhausted — send payment prompt once
+        await bot.sendMessage(
+          chatId,
+          "Your 30 free alerts have been used up.\n\nTo continue receiving alerts, subscribe for $5/month.\n\nSend $5 in USDC, USDT, or SOL to:\n\n" +
+            process.env.WALLET_ADDRESS +
+            "\n\nThen tap /verify to confirm your payment.",
+        );
+      }
     } catch (e) {
       console.error("Failed to send to " + chatId + ":", e.message);
     }
